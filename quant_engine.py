@@ -109,10 +109,21 @@ def main():
         timeframe_raw = input_data.get('Timeframe', '4h')
         risk_profile_raw = input_data.get('RiskProfile', 'Standard')
         
-        # Clean up emoji-prefixed values from Notion (e.g., "🔥 4h" → "4h")
-        # Extract the last word which is the actual value
-        timeframe = timeframe_raw.split()[-1] if timeframe_raw else '4h'
-        risk_profile = risk_profile_raw.split()[-1] if risk_profile_raw else 'Standard'
+        # Robust extraction of values from emoji-prefixed Notion strings
+        # Detect known keywords rather than relying on position
+        import re
+        
+        # Timeframe: look for patterns like 1h, 4h, 1d, 15m, etc.
+        timeframe_match = re.search(r'\b(\d+[mhdwM])\b', timeframe_raw or '')
+        timeframe = timeframe_match.group(1) if timeframe_match else '4h'
+        
+        # Risk Profile: look for known keywords
+        risk_keywords = ['Conservative', 'Standard', 'Aggressive']
+        risk_profile = 'Standard'  # default
+        for keyword in risk_keywords:
+            if keyword.lower() in (risk_profile_raw or '').lower():
+                risk_profile = keyword
+                break
         
         coin_pair = f"{coin}/USDT"
         
