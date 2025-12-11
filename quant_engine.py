@@ -107,6 +107,7 @@ def main():
         
         coin = input_data.get('Coin', 'BTC')
         timeframe = input_data.get('Timeframe', '4h')
+        risk_profile = input_data.get('RiskProfile', 'Standard')  # Conservative, Standard, Aggressive
         coin_pair = f"{coin}/USDT"
         
         # 2. Data Acquisition
@@ -271,6 +272,7 @@ def main():
         result = {
             "coin": coin,
             "price": round(current_price, 4),
+            "risk_profile": risk_profile,
             "indicators": {
                 "rsi": round(rsi_value, 2),
                 "ema_50": round(ema_50, 4),
