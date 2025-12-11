@@ -120,7 +120,7 @@ def main():
     # 5. Visuals
     buf = io.BytesIO()
     mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', volume='in')
-    s = mpf.make_mpf_style(marketcolors=mc, base_style='yahoo', gridstyle=':', rc={'font.size': 12})
+    s = mpf.make_mpf_style(marketcolors=mc, style='yahoo', gridstyle=':', rc={'font.size': 12})
     add_plots = [
         mpf.make_addplot(df['EMA_50'].tail(80), color='orange', width=1.5),
         mpf.make_addplot(df['EMA_200'].tail(80), color='blue', width=2.0)
