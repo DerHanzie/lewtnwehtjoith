@@ -106,8 +106,14 @@ def main():
             input_data = {"Coin": "BTC", "Timeframe": "4h"}
         
         coin = input_data.get('Coin', 'BTC')
-        timeframe = input_data.get('Timeframe', '4h')
-        risk_profile = input_data.get('RiskProfile', 'Standard')  # Conservative, Standard, Aggressive
+        timeframe_raw = input_data.get('Timeframe', '4h')
+        risk_profile_raw = input_data.get('RiskProfile', 'Standard')
+        
+        # Clean up emoji-prefixed values from Notion (e.g., "🔥 4h" → "4h")
+        # Extract the last word which is the actual value
+        timeframe = timeframe_raw.split()[-1] if timeframe_raw else '4h'
+        risk_profile = risk_profile_raw.split()[-1] if risk_profile_raw else 'Standard'
+        
         coin_pair = f"{coin}/USDT"
         
         # 2. Data Acquisition
