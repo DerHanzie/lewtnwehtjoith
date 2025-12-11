@@ -4,15 +4,40 @@ Sovereign Crypto Architect V2.2 - Python Quant Engine
 This script is called by n8n's Execute Command node.
 Input: JSON via stdin (coin, timeframe)
 Output: JSON via stdout (analysis results)
+
+NOTE: Using pure pandas for indicators (no pandas-ta/numba dependency)
 """
 import sys
 import json
 import ccxt
 import pandas as pd
-import pandas_ta as ta
 import mplfinance as mpf
 import io
 import base64
+
+# === INDICATOR FUNCTIONS (Pure Pandas) ===
+def calc_ema(series, period):
+    """Exponential Moving Average"""
+    return series.ewm(span=period, adjust=False).mean()
+
+def calc_rsi(series, period=14):
+    """Relative Strength Index"""
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calc_atr(df, period=14):
+    """Average True Range"""
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
 def main():
     # 1. Read input from stdin (n8n passes JSON)
@@ -33,22 +58,22 @@ def main():
     
     # BTC Correlation
     btc_ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe, limit=500)
-    df_btc = pd.DataFrame(btc_ohlcv, columns=['timestamp', 'open_btc', 'high_btc', 'low_btc', 'close_btc', 'volume_btc'])
+    df_btc = pd.DataFrame(btc_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     
-    # 3. Indicators
-    df.ta.ema(length=50, append=True)
-    df.ta.ema(length=200, append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.atr(length=14, append=True)
-    df_btc.ta.ema(length=200, append=True)
+    # 3. Indicators (Pure Pandas - No pandas-ta)
+    df['EMA_50'] = calc_ema(df['close'], 50)
+    df['EMA_200'] = calc_ema(df['close'], 200)
+    df['RSI_14'] = calc_rsi(df['close'], 14)
+    df['ATR_14'] = calc_atr(df, 14)
+    df_btc['EMA_200'] = calc_ema(df_btc['close'], 200)
     
     # 4. Logic
     current_price = float(df['close'].iloc[-1])
     ema_50 = float(df['EMA_50'].iloc[-1])
     ema_200 = float(df['EMA_200'].iloc[-1])
     rsi_value = float(df['RSI_14'].iloc[-1])
-    atr_value = float(df['ATRr_14'].iloc[-1])
-    btc_price = float(df_btc['close_btc'].iloc[-1])
+    atr_value = float(df['ATR_14'].iloc[-1])
+    btc_price = float(df_btc['close'].iloc[-1])
     btc_ema_200 = float(df_btc['EMA_200'].iloc[-1])
     
     ema_spread = (ema_50 - ema_200) / ema_200
