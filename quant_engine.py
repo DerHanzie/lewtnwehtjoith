@@ -55,6 +55,7 @@ def main():
     ohlcv = exchange.fetch_ohlcv(coin_pair, timeframe, limit=500)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
     
     # BTC Correlation
     btc_ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe, limit=500)
