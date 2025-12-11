@@ -1,7 +1,7 @@
 #!/opt/venv/bin/python3
 """
-Sovereign Crypto Architect V2.3 - Python Quant Engine
-Enhanced with MACD, Volume Analysis, and Meaningful Confidence Scoring
+Sovereign Crypto Architect V2.5 - Python Quant Engine
+Enhanced with Multi-Timeframe Confirmation, Score Breakdown, and Fixed SELL Logic
 
 Input: JSON via stdin (coin, timeframe)
 Output: JSON via stdout (analysis results)
@@ -97,6 +97,93 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
+
+def analyze_timeframe(exchange, coin_pair, timeframe):
+    """
+    Analyze a single timeframe and return trend status.
+    Returns dict with bullish status and key indicators.
+    """
+    try:
+        ohlcv = exchange.fetch_ohlcv(coin_pair, timeframe, limit=250)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        
+        df['EMA_50'] = calc_ema(df['close'], 50)
+        df['EMA_200'] = calc_ema(df['close'], 200)
+        
+        current_price = safe_float(df['close'].iloc[-1])
+        ema_50 = safe_float(df['EMA_50'].iloc[-1])
+        ema_200 = safe_float(df['EMA_200'].iloc[-1])
+        
+        is_bullish = current_price > ema_200 and ema_50 > ema_200
+        ema_spread = (ema_50 - ema_200) / ema_200 if ema_200 > 0 else 0
+        
+        return {
+            "timeframe": timeframe,
+            "is_bullish": is_bullish,
+            "price": current_price,
+            "ema_50": ema_50,
+            "ema_200": ema_200,
+            "ema_spread_pct": round(ema_spread * 100, 2)
+        }
+    except Exception as e:
+        return {
+            "timeframe": timeframe,
+            "is_bullish": False,
+            "error": str(e)
+        }
+
+
+def check_multi_timeframe_alignment(exchange, coin_pair, primary_tf='4h'):
+    """
+    Check trend alignment across multiple timeframes.
+    Returns alignment score and details.
+    
+    Timeframe hierarchy:
+    - 1h: Short-term momentum
+    - 4h: Primary trading timeframe
+    - 1d: Major trend direction
+    """
+    timeframes_to_check = ['1h', '4h', '1d']
+    
+    # Remove primary if already in list to avoid duplicate
+    if primary_tf in timeframes_to_check:
+        timeframes_to_check.remove(primary_tf)
+    timeframes_to_check.insert(0, primary_tf)
+    
+    results = []
+    bullish_count = 0
+    
+    for tf in timeframes_to_check[:3]:  # Max 3 timeframes
+        analysis = analyze_timeframe(exchange, coin_pair, tf)
+        results.append(analysis)
+        if analysis.get("is_bullish", False):
+            bullish_count += 1
+    
+    # Calculate alignment
+    total_checked = len(results)
+    alignment_score = bullish_count / total_checked if total_checked > 0 else 0
+    
+    # Determine overall alignment status
+    if bullish_count == total_checked:
+        alignment_status = "FULL_ALIGNMENT"
+    elif bullish_count >= 2:
+        alignment_status = "PARTIAL_ALIGNMENT"
+    elif bullish_count == 1:
+        alignment_status = "WEAK_ALIGNMENT"
+    else:
+        alignment_status = "NO_ALIGNMENT"
+    
+    return {
+        "alignment_status": alignment_status,
+        "alignment_score": round(alignment_score, 2),
+        "bullish_timeframes": bullish_count,
+        "total_timeframes": total_checked,
+        "details": results
+    }
+
+
 def main():
     try:
         # 1. Read input from stdin (n8n passes JSON)
@@ -110,7 +197,6 @@ def main():
         risk_profile_raw = input_data.get('RiskProfile', 'Standard')
         
         # Robust extraction of values from emoji-prefixed Notion strings
-        # Detect known keywords rather than relying on position
         import re
         
         # Timeframe: look for patterns like 1h, 4h, 1d, 15m, etc.
@@ -146,7 +232,7 @@ def main():
         df['RSI_14'] = calc_rsi(df['close'], 14)
         df['ATR_14'] = calc_atr(df, 14)
         
-        # NEW: MACD for momentum confirmation
+        # MACD for momentum confirmation
         macd_line, signal_line, histogram = calc_macd(df['close'])
         df['MACD'] = macd_line
         df['MACD_Signal'] = signal_line
@@ -163,16 +249,19 @@ def main():
         btc_price = safe_float(df_btc['close'].iloc[-1])
         btc_ema_200 = safe_float(df_btc['EMA_200'].iloc[-1])
         
-        # NEW: MACD values
+        # MACD values
         macd_hist_current = safe_float(df['MACD_Hist'].iloc[-1])
         macd_hist_prev = safe_float(df['MACD_Hist'].iloc[-2])
         macd_line_val = safe_float(df['MACD'].iloc[-1])
         macd_signal_val = safe_float(df['MACD_Signal'].iloc[-1])
         
-        # NEW: Volume analysis
+        # Volume analysis
         volume_analysis = analyze_volume(df)
         
-        # 5. Trend Analysis
+        # 5. Multi-Timeframe Analysis (NEW in V2.5)
+        mtf_analysis = check_multi_timeframe_alignment(exchange, coin_pair, timeframe)
+        
+        # 6. Trend Analysis
         if ema_200 == 0:
             ema_spread = 0
         else:
@@ -194,16 +283,17 @@ def main():
         rsi_exit_threshold = 80 if trend_strength == "STRONG_BULL" else 75
         btc_bullish = btc_price > btc_ema_200
         
-        # 6. MACD Momentum Analysis
+        # 7. MACD Momentum Analysis
         macd_bullish = macd_hist_current > 0
         macd_accelerating = macd_hist_current > macd_hist_prev
         macd_crossover = macd_line_val > macd_signal_val and macd_hist_prev <= 0
         
-        # 7. Signal Logic (Enhanced)
+        # 8. Signal Logic (Enhanced with MTF)
         signal = "WAIT"
         unwind_position = False
         reason = []
-        quality_flags = []  # Track what conditions are met for confidence
+        quality_flags = []
+        score_breakdown = []  # NEW: Detailed scoring breakdown
         
         # EXIT CHECKS
         if current_price < ema_200:
@@ -220,18 +310,25 @@ def main():
             trend_ok = bullish_regime and btc_bullish
             rsi_ok = rsi_value < dynamic_rsi_threshold
             
-            # NEW: Volume must not be distribution
+            # Volume must not be distribution
             volume_ok = volume_analysis["type"] != "distribution"
             volume_bonus = volume_analysis["type"] == "accumulation"
             
-            # NEW: MACD momentum check
+            # MACD momentum check
             momentum_ok = macd_bullish or macd_accelerating
+            
+            # NEW: Multi-timeframe alignment check
+            mtf_ok = mtf_analysis["alignment_status"] in ["FULL_ALIGNMENT", "PARTIAL_ALIGNMENT"]
             
             if trend_ok and rsi_ok:
                 if volume_analysis["type"] == "distribution":
                     signal = "WAIT"
                     reason.append("Volume shows distribution (selling pressure)")
                     quality_flags.append("VOLUME_WARNING")
+                elif not mtf_ok:
+                    signal = "WAIT"
+                    reason.append(f"Multi-TF not aligned ({mtf_analysis['alignment_status']})")
+                    quality_flags.append("MTF_MISALIGNMENT")
                 elif not momentum_ok and rsi_value > 40:
                     signal = "WAIT"
                     reason.append("MACD momentum not confirming, RSI not oversold enough")
@@ -250,8 +347,10 @@ def main():
                         quality_flags.append("MACD_CROSSOVER")
                     if trend_strength == "STRONG_BULL":
                         quality_flags.append("STRONG_TREND")
+                    if mtf_analysis["alignment_status"] == "FULL_ALIGNMENT":
+                        quality_flags.append("MTF_FULL_ALIGNMENT")
                     
-                    # NEW: Momentum breakout exception
+                    # Momentum breakout exception
                     if rsi_value > dynamic_rsi_threshold and rsi_value < 60:
                         if volume_analysis["ratio"] > 2.0 and macd_crossover:
                             signal = "BUY_CANDIDATE"
@@ -263,13 +362,42 @@ def main():
                 if not btc_bullish:
                     reason.append("BTC bearish (correlation filter)")
         
-        # 8. ATR-Based Risk/Reward (Always calculate for exits too)
-        atr_stop_distance = 2 * atr_value
-        suggested_stop_loss = current_price - atr_stop_distance
-        risk = current_price - suggested_stop_loss
-        suggested_target = current_price + (risk * 2)  # 2:1 R:R minimum
+        # 9. Score Breakdown Calculation (NEW in V2.5)
+        # Always calculate for transparency
+        trend_score = 40 if trend_strength == "STRONG_BULL" else (20 if trend_strength == "WEAK_BULL" else 0)
+        rsi_score = 25 if (25 <= rsi_value <= 35) else (15 if (20 <= rsi_value <= 45) else (10 if rsi_value < 20 else 0))
+        volume_score = 20 if volume_analysis["type"] == "accumulation" else (-25 if volume_analysis["type"] == "distribution" else 0)
+        macd_score = 15 if macd_crossover else (10 if (macd_accelerating and macd_bullish) else (5 if macd_bullish else 0))
+        btc_penalty = -15 if not btc_bullish else 0
+        mtf_bonus = 10 if mtf_analysis["alignment_status"] == "FULL_ALIGNMENT" else (5 if mtf_analysis["alignment_status"] == "PARTIAL_ALIGNMENT" else 0)
         
-        # 9. Visuals
+        raw_score = trend_score + rsi_score + volume_score + macd_score + btc_penalty + mtf_bonus
+        
+        score_breakdown = [
+            f"Trend: {'+' if trend_score >= 0 else ''}{trend_score} ({trend_strength})",
+            f"RSI: {'+' if rsi_score >= 0 else ''}{rsi_score} ({rsi_value:.1f})",
+            f"Volume: {'+' if volume_score >= 0 else ''}{volume_score} ({volume_analysis['type']})",
+            f"MACD: {'+' if macd_score >= 0 else ''}{macd_score}",
+            f"MTF: {'+' if mtf_bonus >= 0 else ''}{mtf_bonus} ({mtf_analysis['alignment_status']})",
+        ]
+        if btc_penalty != 0:
+            score_breakdown.append(f"BTC: {btc_penalty}")
+        
+        score_breakdown_str = " | ".join(score_breakdown)
+        
+        # 10. ATR-Based Risk/Reward
+        # Only calculate meaningful values for BUY signals
+        if signal == "SELL" or signal == "WAIT":
+            # For SELL/WAIT: set to 0 (no targets needed)
+            suggested_stop_loss = 0
+            suggested_target = 0
+        else:
+            atr_stop_distance = 2 * atr_value
+            suggested_stop_loss = current_price - atr_stop_distance
+            risk = current_price - suggested_stop_loss
+            suggested_target = current_price + (risk * 2)  # 2:1 R:R minimum
+        
+        # 11. Visuals
         buf = io.BytesIO()
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', volume='in')
         s = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc, gridstyle=':', rc={'font.size': 12})
@@ -285,7 +413,7 @@ def main():
         buf.seek(0)
         image_base64 = base64.b64encode(buf.read()).decode('utf-8')
         
-        # 10. Output JSON (Enhanced)
+        # 12. Output JSON (Enhanced V2.5)
         result = {
             "coin": coin,
             "price": round(current_price, 4),
@@ -310,17 +438,20 @@ def main():
                 "macd_accelerating": macd_accelerating,
                 "macd_crossover": macd_crossover
             },
+            "multi_timeframe": mtf_analysis,  # NEW in V2.5
             "risk_management": {
                 "atr_value": round(atr_value, 6),
                 "suggested_stop_loss": round(suggested_stop_loss, 4),
                 "suggested_target": round(suggested_target, 4),
-                "risk_reward_ratio": 2.0
+                "risk_reward_ratio": 2.0 if signal == "BUY_CANDIDATE" else 0
             },
             "logic_engine": {
                 "signal": signal,
                 "unwind_position": unwind_position,
                 "reason": "; ".join(reason) if reason else "No specific conditions triggered",
-                "quality_flags": quality_flags
+                "quality_flags": quality_flags,
+                "score_breakdown": score_breakdown_str,  # NEW in V2.5
+                "raw_score": max(0, min(100, raw_score))  # NEW in V2.5
             },
             "image_base64": image_base64
         }
