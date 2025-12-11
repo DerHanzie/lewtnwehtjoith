@@ -1,13 +1,12 @@
 #!/opt/venv/bin/python3
 """
-Sovereign Crypto Architect V2.5 - Python Quant Engine
-Enhanced with Multi-Timeframe Confirmation, Score Breakdown, and Fixed SELL Logic
+Sovereign Crypto Architect V2.6 - Python Quant Engine
+Strategic Upgrades: Bear Trap Protection, Volatility Filter, ADX, Momentum Override, Funding Rates
 
 Input: JSON via stdin (coin, timeframe)
 Output: JSON via stdout (analysis results)
 
-Philosophy: Quality over quantity. One good trade per day > many mediocre ones.
-High confidence = near-certain win.
+Philosophy: Quality over quantity. Protect capital first, then seek gains.
 """
 import sys
 import json
@@ -51,6 +50,40 @@ def calc_macd(series, fast=12, slow=26, signal=9):
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
 
+def calc_adx(df, period=14):
+    """
+    Average Directional Index (ADX) - Measures trend strength
+    ADX > 25 = Trending market
+    ADX < 20 = Ranging/dead market
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    
+    # Calculate directional movement
+    plus_dm = high.diff()
+    minus_dm = low.diff().abs() * -1
+    
+    plus_dm = plus_dm.where((plus_dm > minus_dm.abs()) & (plus_dm > 0), 0)
+    minus_dm = minus_dm.abs().where((minus_dm.abs() > plus_dm) & (minus_dm < 0), 0)
+    
+    # True Range
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Smoothed values
+    atr = tr.rolling(window=period).mean()
+    plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+    
+    # ADX calculation
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
+    adx = dx.rolling(window=period).mean()
+    
+    return adx, plus_di, minus_di
+
 def analyze_volume(df, lookback=20):
     """
     Determine if volume is accumulation or distribution.
@@ -69,9 +102,9 @@ def analyze_volume(df, lookback=20):
     
     if volume_ratio > 1.5:
         strength = "strong"
-        if price_change > 0.01:  # Price up with high volume = buying
+        if price_change > 0.01:
             vol_type = "accumulation"
-        elif price_change < -0.01:  # Price down with high volume = selling
+        elif price_change < -0.01:
             vol_type = "distribution"
     elif volume_ratio > 1.2:
         strength = "moderate"
@@ -99,10 +132,7 @@ def safe_float(value, default=0.0):
 
 
 def analyze_timeframe(exchange, coin_pair, timeframe):
-    """
-    Analyze a single timeframe and return trend status.
-    Returns dict with bullish status and key indicators.
-    """
+    """Analyze a single timeframe and return trend status."""
     try:
         ohlcv = exchange.fetch_ohlcv(coin_pair, timeframe, limit=250)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -136,18 +166,9 @@ def analyze_timeframe(exchange, coin_pair, timeframe):
 
 
 def check_multi_timeframe_alignment(exchange, coin_pair, primary_tf='4h'):
-    """
-    Check trend alignment across multiple timeframes.
-    Returns alignment score and details.
-    
-    Timeframe hierarchy:
-    - 1h: Short-term momentum
-    - 4h: Primary trading timeframe
-    - 1d: Major trend direction
-    """
+    """Check trend alignment across multiple timeframes."""
     timeframes_to_check = ['1h', '4h', '1d']
     
-    # Remove primary if already in list to avoid duplicate
     if primary_tf in timeframes_to_check:
         timeframes_to_check.remove(primary_tf)
     timeframes_to_check.insert(0, primary_tf)
@@ -155,17 +176,15 @@ def check_multi_timeframe_alignment(exchange, coin_pair, primary_tf='4h'):
     results = []
     bullish_count = 0
     
-    for tf in timeframes_to_check[:3]:  # Max 3 timeframes
+    for tf in timeframes_to_check[:3]:
         analysis = analyze_timeframe(exchange, coin_pair, tf)
         results.append(analysis)
         if analysis.get("is_bullish", False):
             bullish_count += 1
     
-    # Calculate alignment
     total_checked = len(results)
     alignment_score = bullish_count / total_checked if total_checked > 0 else 0
     
-    # Determine overall alignment status
     if bullish_count == total_checked:
         alignment_status = "FULL_ALIGNMENT"
     elif bullish_count >= 2:
@@ -184,6 +203,163 @@ def check_multi_timeframe_alignment(exchange, coin_pair, primary_tf='4h'):
     }
 
 
+def fetch_funding_rate(exchange, coin_pair):
+    """
+    Fetch funding rate for perpetual futures.
+    High positive funding = overbought (longs paying shorts)
+    High negative funding = oversold (shorts paying longs)
+    """
+    try:
+        # Convert spot pair to futures format
+        symbol = coin_pair.replace('/', '')
+        funding = exchange.fetch_funding_rate(symbol)
+        rate = funding.get('fundingRate', 0) or 0
+        return {
+            "rate": round(rate * 100, 4),  # Convert to percentage
+            "warning": abs(rate) > 0.0005,  # > 0.05% is notable
+            "extreme": abs(rate) > 0.001,   # > 0.1% is extreme
+            "direction": "LONGS_PAYING" if rate > 0 else "SHORTS_PAYING" if rate < 0 else "NEUTRAL"
+        }
+    except Exception as e:
+        # Fallback if funding rate not available (spot only exchange)
+        return {
+            "rate": 0,
+            "warning": False,
+            "extreme": False,
+            "direction": "UNAVAILABLE",
+            "error": str(e)
+        }
+
+
+def check_bear_trap_protection(df, ema_200, buffer_pct=0.01):
+    """
+    V2.6 Bear Trap Protection:
+    Only trigger SELL if the CLOSED candle is below EMA200 * (1 - buffer)
+    This prevents selling on wicks/liquidity grabs.
+    
+    Args:
+        df: DataFrame with OHLCV data
+        ema_200: Current EMA200 value
+        buffer_pct: Buffer percentage (default 1%)
+    
+    Returns:
+        dict with breakdown confirmation status
+    """
+    # Get the PREVIOUS closed candle (not current incomplete one)
+    # In our case, we already exclude incomplete candles, so use last
+    last_close = safe_float(df['close'].iloc[-1])
+    prev_close = safe_float(df['close'].iloc[-2])
+    
+    # Calculate the buffered threshold
+    breakdown_threshold = ema_200 * (1 - buffer_pct)
+    
+    # Check if BOTH last two candles closed below threshold (confirmation)
+    last_below = last_close < breakdown_threshold
+    prev_below = prev_close < breakdown_threshold
+    
+    # Single candle below = warning, two candles = confirmed breakdown
+    confirmed_breakdown = last_below and prev_below
+    warning_breakdown = last_below and not prev_below
+    
+    return {
+        "confirmed_breakdown": confirmed_breakdown,
+        "warning_breakdown": warning_breakdown,
+        "threshold": round(breakdown_threshold, 4),
+        "last_close": round(last_close, 4),
+        "prev_close": round(prev_close, 4),
+        "buffer_pct": buffer_pct * 100
+    }
+
+
+def check_volatility_filter(df, atr_period=14, multiplier=2.0):
+    """
+    V2.6 Volatility Filter:
+    Block trades when ATR is abnormally high (chaos/crash conditions).
+    
+    Args:
+        df: DataFrame with OHLCV data
+        atr_period: Period for ATR calculation
+        multiplier: How many times average ATR is considered "chaos"
+    
+    Returns:
+        dict with volatility status
+    """
+    atr_series = calc_atr(df, atr_period)
+    current_atr = safe_float(atr_series.iloc[-1])
+    avg_atr = safe_float(atr_series.rolling(50).mean().iloc[-1])
+    
+    if avg_atr == 0:
+        atr_ratio = 1.0
+    else:
+        atr_ratio = current_atr / avg_atr
+    
+    is_chaotic = atr_ratio > multiplier
+    is_elevated = atr_ratio > 1.5
+    
+    # Determine market volatility regime
+    if atr_ratio > 3.0:
+        regime = "EXTREME_VOLATILITY"
+    elif atr_ratio > 2.0:
+        regime = "HIGH_VOLATILITY"
+    elif atr_ratio > 1.5:
+        regime = "ELEVATED_VOLATILITY"
+    else:
+        regime = "NORMAL"
+    
+    return {
+        "current_atr": round(current_atr, 6),
+        "average_atr": round(avg_atr, 6),
+        "atr_ratio": round(atr_ratio, 2),
+        "regime": regime,
+        "is_chaotic": is_chaotic,
+        "is_elevated": is_elevated,
+        "block_trades": is_chaotic,  # Block if chaotic
+        "reduce_confidence": is_elevated  # Reduce confidence if elevated
+    }
+
+
+def check_momentum_override(df, ema_spread, volume_analysis, macd_crossover, rsi_value):
+    """
+    V2.6 Momentum Override:
+    In parabolic/strong trend conditions, relax RSI entry requirements.
+    
+    This catches big moves that traditional RSI rules would miss.
+    """
+    # Check for parabolic conditions
+    is_parabolic = ema_spread > 0.05  # > 5% spread between EMA50 and EMA200
+    
+    # Check for momentum breakout
+    high_volume = volume_analysis.get("ratio", 0) > 2.0
+    momentum_surge = macd_crossover and high_volume
+    
+    # Determine if we should override RSI rules
+    override_active = False
+    max_rsi_override = 45  # Default
+    reason = ""
+    
+    if is_parabolic:
+        override_active = True
+        max_rsi_override = 55  # Allow entries up to RSI 55 in parabolic moves
+        reason = f"Parabolic trend (EMA spread {ema_spread*100:.1f}%)"
+    elif momentum_surge:
+        override_active = True
+        max_rsi_override = 50  # Allow entries up to RSI 50 on momentum surges
+        reason = f"Momentum surge (Volume {volume_analysis.get('ratio', 0):.1f}x + MACD crossover)"
+    
+    # Still reject if RSI is truly overbought
+    if rsi_value > 65:
+        override_active = False
+        reason = f"RSI too high ({rsi_value:.1f}) even for override"
+    
+    return {
+        "override_active": override_active,
+        "max_rsi_allowed": max_rsi_override,
+        "is_parabolic": is_parabolic,
+        "is_momentum_surge": momentum_surge,
+        "reason": reason
+    }
+
+
 def main():
     try:
         # 1. Read input from stdin (n8n passes JSON)
@@ -199,13 +375,11 @@ def main():
         # Robust extraction of values from emoji-prefixed Notion strings
         import re
         
-        # Timeframe: look for patterns like 1h, 4h, 1d, 15m, etc.
         timeframe_match = re.search(r'\b(\d+[mhdwM])\b', timeframe_raw or '')
         timeframe = timeframe_match.group(1) if timeframe_match else '4h'
         
-        # Risk Profile: look for known keywords
         risk_keywords = ['Conservative', 'Standard', 'Aggressive']
-        risk_profile = 'Standard'  # default
+        risk_profile = 'Standard'
         for keyword in risk_keywords:
             if keyword.lower() in (risk_profile_raw or '').lower():
                 risk_profile = keyword
@@ -238,6 +412,10 @@ def main():
         df['MACD_Signal'] = signal_line
         df['MACD_Hist'] = histogram
         
+        # V2.6: ADX for trend strength
+        adx_series, plus_di, minus_di = calc_adx(df)
+        df['ADX'] = adx_series
+        
         df_btc['EMA_200'] = calc_ema(df_btc['close'], 200)
         
         # 4. Extract current values
@@ -246,6 +424,7 @@ def main():
         ema_200 = safe_float(df['EMA_200'].iloc[-1])
         rsi_value = safe_float(df['RSI_14'].iloc[-1], 50.0)
         atr_value = safe_float(df['ATR_14'].iloc[-1])
+        adx_value = safe_float(df['ADX'].iloc[-1], 20.0)
         btc_price = safe_float(df_btc['close'].iloc[-1])
         btc_ema_200 = safe_float(df_btc['EMA_200'].iloc[-1])
         
@@ -258,8 +437,13 @@ def main():
         # Volume analysis
         volume_analysis = analyze_volume(df)
         
-        # 5. Multi-Timeframe Analysis (NEW in V2.5)
+        # 5. V2.6 Strategic Checks
         mtf_analysis = check_multi_timeframe_alignment(exchange, coin_pair, timeframe)
+        volatility_check = check_volatility_filter(df)
+        bear_trap_check = check_bear_trap_protection(df, ema_200)
+        
+        # Funding rate (may fail on spot-only)
+        funding_rate = fetch_funding_rate(exchange, coin_pair)
         
         # 6. Trend Analysis
         if ema_200 == 0:
@@ -288,82 +472,112 @@ def main():
         macd_accelerating = macd_hist_current > macd_hist_prev
         macd_crossover = macd_line_val > macd_signal_val and macd_hist_prev <= 0
         
-        # 8. Signal Logic (Enhanced with MTF)
+        # V2.6: Momentum Override Check
+        momentum_override = check_momentum_override(
+            df, ema_spread, volume_analysis, macd_crossover, rsi_value
+        )
+        
+        # Apply momentum override to RSI threshold
+        if momentum_override["override_active"]:
+            dynamic_rsi_threshold = momentum_override["max_rsi_allowed"]
+        
+        # V2.6: ADX Market Regime
+        adx_regime = "TRENDING" if adx_value > 25 else ("WEAK_TREND" if adx_value > 20 else "RANGING")
+        market_is_dead = adx_value < 15
+        
+        # 8. Signal Logic (V2.6 Enhanced)
         signal = "WAIT"
         unwind_position = False
         reason = []
         quality_flags = []
-        score_breakdown = []  # NEW: Detailed scoring breakdown
+        score_breakdown = []
         
-        # EXIT CHECKS
-        if current_price < ema_200:
-            unwind_position = True
-            reason.append("Trend Broken (Price < EMA200)")
-        elif rsi_value > rsi_exit_threshold:
-            unwind_position = True
-            reason.append(f"RSI Overextended (>{rsi_exit_threshold})")
+        # V2.6: VOLATILITY BLOCK (highest priority)
+        if volatility_check["block_trades"]:
+            signal = "WAIT"
+            reason.append(f"VOLATILITY BLOCK: ATR {volatility_check['atr_ratio']:.1f}x average ({volatility_check['regime']})")
+            quality_flags.append("VOLATILITY_BLOCK")
         
-        if unwind_position:
-            signal = "SELL"
+        # V2.6: DEAD MARKET BLOCK
+        elif market_is_dead:
+            signal = "WAIT"
+            reason.append(f"DEAD MARKET: ADX {adx_value:.1f} (no trend)")
+            quality_flags.append("DEAD_MARKET")
+        
         else:
-            # ENTRY EVALUATION
-            trend_ok = bullish_regime and btc_bullish
-            rsi_ok = rsi_value < dynamic_rsi_threshold
+            # EXIT CHECKS (V2.6: Use Bear Trap Protection)
+            if bear_trap_check["confirmed_breakdown"]:
+                unwind_position = True
+                reason.append(f"Confirmed Breakdown: 2 candles below EMA200*{100-bear_trap_check['buffer_pct']:.0f}%")
+            elif bear_trap_check["warning_breakdown"]:
+                # Single candle below - just warn, don't sell yet
+                quality_flags.append("BREAKDOWN_WARNING")
+                reason.append(f"Breakdown Warning: 1 candle below threshold, watching...")
+            elif rsi_value > rsi_exit_threshold:
+                unwind_position = True
+                reason.append(f"RSI Overextended (>{rsi_exit_threshold})")
             
-            # Volume must not be distribution
-            volume_ok = volume_analysis["type"] != "distribution"
-            volume_bonus = volume_analysis["type"] == "accumulation"
-            
-            # MACD momentum check
-            momentum_ok = macd_bullish or macd_accelerating
-            
-            # NEW: Multi-timeframe alignment check
-            mtf_ok = mtf_analysis["alignment_status"] in ["FULL_ALIGNMENT", "PARTIAL_ALIGNMENT"]
-            
-            if trend_ok and rsi_ok:
-                if volume_analysis["type"] == "distribution":
-                    signal = "WAIT"
-                    reason.append("Volume shows distribution (selling pressure)")
-                    quality_flags.append("VOLUME_WARNING")
-                elif not mtf_ok:
-                    signal = "WAIT"
-                    reason.append(f"Multi-TF not aligned ({mtf_analysis['alignment_status']})")
-                    quality_flags.append("MTF_MISALIGNMENT")
-                elif not momentum_ok and rsi_value > 40:
-                    signal = "WAIT"
-                    reason.append("MACD momentum not confirming, RSI not oversold enough")
-                else:
-                    signal = "BUY_CANDIDATE"
-                    reason.append(f"Trend: {trend_strength}")
-                    
-                    # Track quality for confidence scoring
-                    if rsi_value >= 25 and rsi_value <= 35:
-                        quality_flags.append("OPTIMAL_RSI")
-                    if volume_bonus:
-                        quality_flags.append("ACCUMULATION")
-                    if macd_accelerating:
-                        quality_flags.append("MOMENTUM_ACCELERATING")
-                    if macd_crossover:
-                        quality_flags.append("MACD_CROSSOVER")
-                    if trend_strength == "STRONG_BULL":
-                        quality_flags.append("STRONG_TREND")
-                    if mtf_analysis["alignment_status"] == "FULL_ALIGNMENT":
-                        quality_flags.append("MTF_FULL_ALIGNMENT")
-                    
-                    # Momentum breakout exception
-                    if rsi_value > dynamic_rsi_threshold and rsi_value < 60:
-                        if volume_analysis["ratio"] > 2.0 and macd_crossover:
-                            signal = "BUY_CANDIDATE"
-                            reason.append("Momentum breakout (high volume + MACD crossover)")
-                            quality_flags.append("BREAKOUT_ENTRY")
+            if unwind_position:
+                signal = "SELL"
             else:
-                if not bullish_regime:
-                    reason.append("Price below trend (EMA filter)")
-                if not btc_bullish:
-                    reason.append("BTC bearish (correlation filter)")
+                # ENTRY EVALUATION
+                trend_ok = bullish_regime and btc_bullish
+                rsi_ok = rsi_value < dynamic_rsi_threshold
+                
+                volume_ok = volume_analysis["type"] != "distribution"
+                volume_bonus = volume_analysis["type"] == "accumulation"
+                
+                momentum_ok = macd_bullish or macd_accelerating
+                
+                mtf_ok = mtf_analysis["alignment_status"] in ["FULL_ALIGNMENT", "PARTIAL_ALIGNMENT"]
+                
+                if trend_ok and rsi_ok:
+                    if volume_analysis["type"] == "distribution":
+                        signal = "WAIT"
+                        reason.append("Volume shows distribution (selling pressure)")
+                        quality_flags.append("VOLUME_WARNING")
+                    elif not mtf_ok:
+                        signal = "WAIT"
+                        reason.append(f"Multi-TF not aligned ({mtf_analysis['alignment_status']})")
+                        quality_flags.append("MTF_MISALIGNMENT")
+                    elif not momentum_ok and rsi_value > 40:
+                        signal = "WAIT"
+                        reason.append("MACD momentum not confirming, RSI not oversold enough")
+                    else:
+                        signal = "BUY_CANDIDATE"
+                        reason.append(f"Trend: {trend_strength}, ADX: {adx_regime}")
+                        
+                        # Track quality for confidence scoring
+                        if rsi_value >= 25 and rsi_value <= 35:
+                            quality_flags.append("OPTIMAL_RSI")
+                        if volume_bonus:
+                            quality_flags.append("ACCUMULATION")
+                        if macd_accelerating:
+                            quality_flags.append("MOMENTUM_ACCELERATING")
+                        if macd_crossover:
+                            quality_flags.append("MACD_CROSSOVER")
+                        if trend_strength == "STRONG_BULL":
+                            quality_flags.append("STRONG_TREND")
+                        if mtf_analysis["alignment_status"] == "FULL_ALIGNMENT":
+                            quality_flags.append("MTF_FULL_ALIGNMENT")
+                        if adx_value > 30:
+                            quality_flags.append("STRONG_ADX")
+                        if momentum_override["override_active"]:
+                            quality_flags.append("MOMENTUM_OVERRIDE")
+                        
+                        # V2.6: Funding Rate Warning
+                        if funding_rate.get("extreme"):
+                            quality_flags.append("EXTREME_FUNDING")
+                            reason.append(f"⚠️ Funding Rate extreme: {funding_rate['rate']:.3f}%")
+                        elif funding_rate.get("warning"):
+                            quality_flags.append("HIGH_FUNDING")
+                else:
+                    if not bullish_regime:
+                        reason.append("Price below trend (EMA filter)")
+                    if not btc_bullish:
+                        reason.append("BTC bearish (correlation filter)")
         
-        # 9. Score Breakdown Calculation (NEW in V2.5)
-        # Always calculate for transparency
+        # 9. Score Breakdown Calculation (V2.6 Enhanced)
         trend_score = 40 if trend_strength == "STRONG_BULL" else (20 if trend_strength == "WEAK_BULL" else 0)
         rsi_score = 25 if (25 <= rsi_value <= 35) else (15 if (20 <= rsi_value <= 45) else (10 if rsi_value < 20 else 0))
         volume_score = 20 if volume_analysis["type"] == "accumulation" else (-25 if volume_analysis["type"] == "distribution" else 0)
@@ -371,7 +585,13 @@ def main():
         btc_penalty = -15 if not btc_bullish else 0
         mtf_bonus = 10 if mtf_analysis["alignment_status"] == "FULL_ALIGNMENT" else (5 if mtf_analysis["alignment_status"] == "PARTIAL_ALIGNMENT" else 0)
         
-        raw_score = trend_score + rsi_score + volume_score + macd_score + btc_penalty + mtf_bonus
+        # V2.6: ADX bonus
+        adx_bonus = 10 if adx_value > 30 else (5 if adx_value > 25 else 0)
+        
+        # V2.6: Volatility penalty
+        volatility_penalty = -15 if volatility_check["is_chaotic"] else (-5 if volatility_check["is_elevated"] else 0)
+        
+        raw_score = trend_score + rsi_score + volume_score + macd_score + btc_penalty + mtf_bonus + adx_bonus + volatility_penalty
         
         score_breakdown = [
             f"Trend: {'+' if trend_score >= 0 else ''}{trend_score} ({trend_strength})",
@@ -379,30 +599,30 @@ def main():
             f"Volume: {'+' if volume_score >= 0 else ''}{volume_score} ({volume_analysis['type']})",
             f"MACD: {'+' if macd_score >= 0 else ''}{macd_score}",
             f"MTF: {'+' if mtf_bonus >= 0 else ''}{mtf_bonus} ({mtf_analysis['alignment_status']})",
+            f"ADX: {'+' if adx_bonus >= 0 else ''}{adx_bonus} ({adx_value:.1f})",
         ]
         if btc_penalty != 0:
             score_breakdown.append(f"BTC: {btc_penalty}")
+        if volatility_penalty != 0:
+            score_breakdown.append(f"Volatility: {volatility_penalty}")
         
         score_breakdown_str = " | ".join(score_breakdown)
         
         # 10. ATR-Based Risk/Reward
-        # Only calculate meaningful values for BUY signals
         if signal == "SELL" or signal == "WAIT":
-            # For SELL/WAIT: set to 0 (no targets needed)
             suggested_stop_loss = 0
             suggested_target = 0
         else:
             atr_stop_distance = 2 * atr_value
             suggested_stop_loss = current_price - atr_stop_distance
             risk = current_price - suggested_stop_loss
-            suggested_target = current_price + (risk * 2)  # 2:1 R:R minimum
+            suggested_target = current_price + (risk * 2)
         
         # 11. Visuals
         buf = io.BytesIO()
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', volume='in')
         s = mpf.make_mpf_style(base_mpf_style='yahoo', marketcolors=mc, gridstyle=':', rc={'font.size': 12})
         
-        # Enhanced plot with MACD panel
         add_plots = [
             mpf.make_addplot(df['EMA_50'].tail(80), color='orange', width=1.5),
             mpf.make_addplot(df['EMA_200'].tail(80), color='blue', width=2.0),
@@ -413,7 +633,7 @@ def main():
         buf.seek(0)
         image_base64 = base64.b64encode(buf.read()).decode('utf-8')
         
-        # 12. Output JSON (Enhanced V2.5)
+        # 12. Output JSON (V2.6 Enhanced)
         result = {
             "coin": coin,
             "price": round(current_price, 4),
@@ -423,6 +643,7 @@ def main():
                 "ema_50": round(ema_50, 4),
                 "ema_200": round(ema_200, 4),
                 "atr": round(atr_value, 6),
+                "adx": round(adx_value, 2),
                 "macd_histogram": round(macd_hist_current, 6),
                 "macd_accelerating": macd_accelerating
             },
@@ -430,7 +651,8 @@ def main():
                 "trend_strength": trend_strength,
                 "btc_bullish": btc_bullish,
                 "rsi_exit_threshold": rsi_exit_threshold,
-                "ema_spread_pct": round(ema_spread * 100, 2)
+                "ema_spread_pct": round(ema_spread * 100, 2),
+                "adx_regime": adx_regime
             },
             "volume_analysis": volume_analysis,
             "momentum": {
@@ -438,7 +660,12 @@ def main():
                 "macd_accelerating": macd_accelerating,
                 "macd_crossover": macd_crossover
             },
-            "multi_timeframe": mtf_analysis,  # NEW in V2.5
+            "multi_timeframe": mtf_analysis,
+            # V2.6 New Analysis
+            "volatility": volatility_check,
+            "bear_trap_protection": bear_trap_check,
+            "momentum_override": momentum_override,
+            "funding_rate": funding_rate,
             "risk_management": {
                 "atr_value": round(atr_value, 6),
                 "suggested_stop_loss": round(suggested_stop_loss, 4),
@@ -450,8 +677,8 @@ def main():
                 "unwind_position": unwind_position,
                 "reason": "; ".join(reason) if reason else "No specific conditions triggered",
                 "quality_flags": quality_flags,
-                "score_breakdown": score_breakdown_str,  # NEW in V2.5
-                "raw_score": max(0, min(100, raw_score))  # NEW in V2.5
+                "score_breakdown": score_breakdown_str,
+                "raw_score": max(0, min(100, raw_score))
             },
             "image_base64": image_base64
         }
