@@ -15,6 +15,31 @@ import pandas as pd
 import mplfinance as mpf
 import io
 import base64
+import pytz
+from datetime import datetime
+
+# === DATETIME CONFIGURATION ===
+# Project timezone: Europe/Amsterdam (CET/CEST)
+TIMEZONE = pytz.timezone('Europe/Amsterdam')
+DATE_FORMAT = '%Y-%m-%d'
+DATETIME_FORMAT = '%Y-%m-%d %H:%M'
+DATETIME_FORMAT_FULL = '%Y-%m-%d %H:%M:%S %Z'
+
+def get_current_time():
+    """Get current time in Amsterdam timezone."""
+    return datetime.now(TIMEZONE)
+
+def format_timestamp(timestamp_ms, format_str=DATETIME_FORMAT):
+    """Convert millisecond timestamp to formatted string in Amsterdam timezone."""
+    dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=pytz.UTC)
+    dt_local = dt.astimezone(TIMEZONE)
+    return dt_local.strftime(format_str)
+
+def to_amsterdam_tz(dt):
+    """Convert any datetime to Amsterdam timezone."""
+    if dt.tzinfo is None:
+        dt = pytz.UTC.localize(dt)
+    return dt.astimezone(TIMEZONE)
 
 # === INDICATOR FUNCTIONS (Pure Pandas) ===
 
@@ -136,7 +161,9 @@ def analyze_timeframe(exchange, coin_pair, timeframe):
     try:
         ohlcv = exchange.fetch_ohlcv(coin_pair, timeframe, limit=250)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # Convert to timezone-aware datetime (UTC -> Europe/Amsterdam)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df['timestamp'] = df['timestamp'].dt.tz_convert('Europe/Amsterdam')
         df.set_index('timestamp', inplace=True)
         
         df['EMA_50'] = calc_ema(df['close'], 50)
@@ -391,13 +418,17 @@ def main():
         exchange = ccxt.binance()
         ohlcv = exchange.fetch_ohlcv(coin_pair, timeframe, limit=500)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # Convert to timezone-aware datetime (UTC -> Europe/Amsterdam)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df['timestamp'] = df['timestamp'].dt.tz_convert('Europe/Amsterdam')
         df.set_index('timestamp', inplace=True)
         
         # BTC Correlation
         btc_ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe, limit=500)
         df_btc = pd.DataFrame(btc_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_btc['timestamp'] = pd.to_datetime(df_btc['timestamp'], unit='ms')
+        # Convert to timezone-aware datetime (UTC -> Europe/Amsterdam)
+        df_btc['timestamp'] = pd.to_datetime(df_btc['timestamp'], unit='ms', utc=True)
+        df_btc['timestamp'] = df_btc['timestamp'].dt.tz_convert('Europe/Amsterdam')
         df_btc.set_index('timestamp', inplace=True)
         
         # 3. Indicators (Pure Pandas)
