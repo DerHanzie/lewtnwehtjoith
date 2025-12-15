@@ -1,15 +1,21 @@
 #!/opt/venv/bin/python3
 """
-Sovereign Crypto Architect V2.6 - Python Quant Engine
+Sovereign Crypto Architect V3.0 - Python Quant Engine
 Strategic Upgrades: Bear Trap Protection, Volatility Filter, ADX, Momentum Override, Funding Rates
+V3.0 Addition: Ticker Mode for fast price checks (Trade Manager support)
+
+Modes:
+  --mode analysis  (default) Full signal generation with chart
+  --mode ticker    Fast price check for SL/TP monitoring
 
 Input: JSON via stdin (coin, timeframe)
-Output: JSON via stdout (analysis results)
+Output: JSON via stdout (analysis results or ticker data)
 
 Philosophy: Quality over quantity. Protect capital first, then seek gains.
 """
 import sys
 import json
+import argparse
 import ccxt
 import pandas as pd
 import mplfinance as mpf
@@ -389,6 +395,13 @@ def check_momentum_override(df, ema_spread, volume_analysis, macd_crossover, rsi
 
 def main():
     try:
+        # 0. Parse command line arguments
+        parser = argparse.ArgumentParser(description='Sovereign Crypto Architect V3.0')
+        parser.add_argument('--mode', type=str, default='analysis',
+                            choices=['analysis', 'ticker'],
+                            help='analysis = full signal, ticker = fast price check')
+        args, unknown = parser.parse_known_args()  # Handle extra args from n8n cleanly
+        
         # 1. Read input from stdin (n8n passes JSON)
         try:
             input_data = json.loads(sys.stdin.read())
@@ -413,6 +426,38 @@ def main():
                 break
         
         coin_pair = f"{coin}/USDT"
+        
+        # === TICKER MODE: Fast path for Trade Manager ===
+        if args.mode == 'ticker':
+            exchange = ccxt.binance()
+            ticker = exchange.fetch_ticker(coin_pair)
+            
+            # Get last few candles for wick checking
+            ohlcv = exchange.fetch_ohlcv(coin_pair, timeframe, limit=5)
+            last_candle = ohlcv[-2]     # Previous COMPLETED candle (safe for SL/TP)
+            current_candle = ohlcv[-1]  # Current INCOMPLETE candle (info only)
+            
+            output = {
+                "coin": coin,
+                "mode": "ticker",
+                "timeframe": timeframe,
+                "current_price": ticker['last'],
+                "simulation_data": {
+                    # CRITICAL: SL/TP checks use CLOSED candle data only (no repainting)
+                    "last_closed_high": last_candle[2],
+                    "last_closed_low": last_candle[3],
+                    "last_closed_close": last_candle[4],
+                    "last_closed_timestamp": format_timestamp(last_candle[0]),
+                    # Info only - do NOT use for SL/TP decisions
+                    "current_candle_high": current_candle[2],
+                    "current_candle_low": current_candle[3]
+                },
+                "timestamp": get_current_time().strftime(DATETIME_FORMAT)
+            }
+            print(json.dumps(output))
+            sys.exit(0)  # STOP HERE for ticker mode
+        
+        # === ANALYSIS MODE: Full signal generation (continue below) ===
         
         # 2. Data Acquisition
         exchange = ccxt.binance()
